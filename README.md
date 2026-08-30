@@ -237,21 +237,6 @@ advisory**.
 - **Member 2 — Risk Engine & AI:** heat index, scoring, attribution, alerts
 - **Member 3 — Full Stack & UI:** FastAPI, Next.js, Leaflet, deployment
 
-## Submission documents
-
-| File | Purpose |
-|---|---|
-| `docs/DEPLOYMENT_GUIDE.md` | Step-by-step deployment (Render + Vercel) and full submission checklist |
-| `docs/HOW_TO_SUBMIT.md` | Baby-steps final walkthrough: video, deck, and the actual submission |
-| `docs/PROJECT_DESCRIPTION.md` | Problem, solution, impact, scalability |
-| `docs/TECHNOLOGY_INNOVATION.md` | Tech stack and innovation explanation |
-| `docs/PITCH_DECK_CONTENT.md` | Slide-by-slide pitch deck content |
-| `docs/DEMO_SCRIPT.md` | Timed ≤3-minute demo video script |
-| `docs/METHODOLOGY.md` | How the risk score works, in full |
-| `docs/DATA_SOURCES.md` | Every data source, with provenance and limitations |
-| `docs/AUTO_REFRESH.md` | How automatic data refresh works, and deployment implications |
-
 ## License
 
-Prepared for the Smart City Hackathon 2026. See individual data sources for
-their respective licenses (Open-Meteo, OpenStreetMap/ODbL, PBS).
+Prepared for the Smart City Hackathon 2026.
