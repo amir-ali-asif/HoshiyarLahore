@@ -28,6 +28,7 @@ to do a quick smoke test against Lahore's centroid.
 from __future__ import annotations
 
 import datetime as dt
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,6 +38,46 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 TIMEZONE = "Asia/Karachi"
 REQUEST_TIMEOUT = 30
+
+
+def _get_with_retry(url: str, params: dict, max_retries: int = 3):
+    """
+    GET with retry-and-backoff specifically for HTTP 429 (Too Many Requests).
+
+    Open-Meteo's free tier is generous (600/min, 5000/hour, 10000/day - see
+    https://open-meteo.com/en/terms) but a burst of near-simultaneous requests
+    (e.g. several towns fetched back-to-back at app startup), especially from
+    a shared/NAT'd IP on a hosting platform's free tier, can still trip a
+    transient 429. Rather than immediately giving up on that town, wait and
+    retry a few times first - this is standard, expected behaviour for any
+    rate-limited API and resolves the large majority of these hiccups.
+    """
+    delay = 2.0
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else delay
+                if attempt < max_retries:
+                    print(f"    429 rate-limited, retrying in {wait:.0f}s "
+                          f"(attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(wait)
+                    delay *= 2
+                    continue
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("_get_with_retry: exhausted retries with no response")
 
 
 # ---------------------------------------------------------------------------
@@ -109,8 +150,7 @@ def fetch_current_and_forecast(
         "timezone": TIMEZONE,
     }
 
-    resp = requests.get(FORECAST_URL, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
+    resp = _get_with_retry(FORECAST_URL, params)
     data = resp.json()
 
     if "current" not in data or "hourly" not in data:
@@ -151,36 +191,35 @@ def fetch_historical_daily_max(
 
     Returns a dict: {"dates": [...], "temp_max_c": [...]}.
 
-    NOTE: The archive API can be slow for long ranges. We fetch year by year
-    to stay within reasonable request sizes and to be resilient to partial
-    failures.
+    ONE REQUEST for the whole date range, not one per year: Open-Meteo's
+    archive API handles a full multi-year range in a single call just fine.
+    Looping year-by-year (the original implementation) multiplied request
+    count by ~10x for no benefit and made this call a major contributor to
+    hitting Open-Meteo's rate limits during startup bursts across several
+    towns. See _get_with_retry() for 429 retry/backoff handling.
+
+    On failure, returns {"dates": [], "temp_max_c": [], "error": "<message>"}
+    rather than silently empty lists, so a caller can report *why* it failed
+    (e.g. a 429 rate limit) instead of guessing "offline".
     """
-    all_dates: list[str] = []
-    all_tmax: list[float] = []
-
-    for year in range(start_year, end_year + 1):
-        params = {
-            "latitude": lat,
-            "longitude": lon,
-            "start_date": f"{year}-01-01",
-            "end_date": f"{year}-12-31",
-            "daily": "temperature_2m_max",
-            "timezone": TIMEZONE,
-        }
-        try:
-            resp = requests.get(ARCHIVE_URL, params=params, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            daily = data.get("daily", {})
-            dates = daily.get("time", [])
-            tmax = daily.get("temperature_2m_max", [])
-            all_dates.extend(dates)
-            all_tmax.extend([_num(v) for v in tmax])
-        except requests.RequestException as exc:
-            print(f"  [archive] year {year} failed: {exc}")
-            continue
-
-    return {"dates": all_dates, "temp_max_c": all_tmax}
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": f"{start_year}-01-01",
+        "end_date": f"{end_year}-12-31",
+        "daily": "temperature_2m_max",
+        "timezone": TIMEZONE,
+    }
+    try:
+        resp = _get_with_retry(ARCHIVE_URL, params)
+        data = resp.json()
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        tmax = daily.get("temperature_2m_max", [])
+        return {"dates": dates, "temp_max_c": [_num(v) for v in tmax]}
+    except requests.RequestException as exc:
+        print(f"  [archive] {start_year}-{end_year} failed: {exc}")
+        return {"dates": [], "temp_max_c": [], "error": str(exc)}
 
 
 def baseline_for_date(

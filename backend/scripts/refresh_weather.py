@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import sys
+import time
 
 # Allow running as a script: add repo root to path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,11 +41,13 @@ from backend.app.services.open_meteo import (  # noqa: E402
 FORECAST_DAYS = 3
 
 
-def refresh_all_towns() -> tuple[int, int]:
-    """Returns (towns_updated, towns_failed) so callers (including the
-    auto-refresh scheduler) can tell a real success from a silent total
+def refresh_all_towns() -> tuple[int, int, str | None]:
+    """Returns (towns_updated, towns_failed, last_error). Callers (including
+    the auto-refresh scheduler) can tell a real success from a silent total
     failure - refresh_all_towns() never raises even when every fetch fails,
-    so the return value is the only reliable signal."""
+    so the return value is the only reliable signal. last_error is the most
+    recent failure's actual message (e.g. "429 ... Too Many Requests"), so a
+    status endpoint can report *why* it failed instead of guessing "offline"."""
     now_iso = dt.datetime.now().isoformat(timespec="seconds")
 
     # Make sure DB + towns exist
@@ -58,6 +61,7 @@ def refresh_all_towns() -> tuple[int, int]:
 
     print(f"Refreshing weather for {len(towns)} towns...")
     ok, failed = 0, 0
+    last_error: str | None = None
 
     for town in towns:
         tid = town["id"]
@@ -70,6 +74,8 @@ def refresh_all_towns() -> tuple[int, int]:
         except Exception as exc:  # noqa: BLE001
             print(f"  [{tid}] FAILED: {exc}")
             failed += 1
+            last_error = str(exc)
+            time.sleep(0.5)  # brief pause even on failure, before the next town
             continue
 
         # Clear previous rows for this town (keep the DB small and current)
@@ -120,13 +126,14 @@ def refresh_all_towns() -> tuple[int, int]:
         print(f"  [{tid}] OK - current {current.temperature_c}C, "
               f"{len(rows)} forecast hours")
         ok += 1
+        time.sleep(0.5)  # brief pause between towns - gentle on the API
 
     conn.close()
     print(f"\nDone. {ok} towns updated, {failed} failed.")
     if failed and ok == 0:
         print("All fetches failed. Are you offline? Open-Meteo needs internet "
               "(no API key required).")
-    return ok, failed
+    return ok, failed, last_error
 
 
 if __name__ == "__main__":

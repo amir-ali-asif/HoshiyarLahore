@@ -33,6 +33,7 @@ import argparse
 import datetime as dt
 import os
 import sys
+import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
@@ -63,10 +64,12 @@ def daterange_month_days(start_month: int, end_month: int):
         d += dt.timedelta(days=1)
 
 
-def refresh_historical(years: int, start_month: int, end_month: int) -> tuple[int, int]:
-    """Returns (towns_updated, towns_failed). Like refresh_all_towns(), this
-    never raises even on total failure, so the return value is the only
-    reliable success signal for callers such as the auto-refresh scheduler."""
+def refresh_historical(years: int, start_month: int, end_month: int) -> tuple[int, int, str | None]:
+    """Returns (towns_updated, towns_failed, last_error). Like
+    refresh_all_towns(), this never raises even on total failure, so the
+    return value is the only reliable success signal for callers such as the
+    auto-refresh scheduler. last_error is the most recent failure's actual
+    message, so a status endpoint can report why, not just that it failed."""
     init_db()
     load_towns_from_metadata()
 
@@ -83,6 +86,7 @@ def refresh_historical(years: int, start_month: int, end_month: int) -> tuple[in
           f"for months {start_month}-{end_month}...")
 
     ok, failed = 0, 0
+    last_error: str | None = None
     for town in towns:
         tid = town["id"]
         print(f"\n[{tid}] fetching archive {start_year}-{end_year} ...")
@@ -91,8 +95,11 @@ def refresh_historical(years: int, start_month: int, end_month: int) -> tuple[in
         )
         n_points = len(historical.get("dates", []))
         if n_points == 0:
-            print(f"  [{tid}] no archive data returned (offline?). Skipping.")
+            err = historical.get("error", "no archive data returned")
+            print(f"  [{tid}] failed: {err}. Skipping.")
+            last_error = err
             failed += 1
+            time.sleep(0.5)
             continue
 
         # Rebuild this town's baseline rows
@@ -114,13 +121,14 @@ def refresh_historical(years: int, start_month: int, end_month: int) -> tuple[in
         print(f"  [{tid}] stored {len(rows)} daily baselines "
               f"(from {n_points} archive days)")
         ok += 1
+        time.sleep(0.5)  # brief pause between towns - gentle on the API
 
     conn.close()
     print("\nHistorical baselines complete.")
     if failed and ok == 0:
         print("All fetches failed. Are you offline? The archive API needs "
               "internet (no API key required).")
-    return ok, failed
+    return ok, failed, last_error
 
 
 if __name__ == "__main__":

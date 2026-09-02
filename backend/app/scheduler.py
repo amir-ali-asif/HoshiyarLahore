@@ -62,20 +62,21 @@ def _refresh_weather_job() -> None:
     global _last_weather_refresh, _last_weather_error
     try:
         from backend.scripts.refresh_weather import refresh_all_towns
-        ok, failed = refresh_all_towns()
+        ok, failed, last_fetch_error = refresh_all_towns()
         if ok == 0:
             # Every town failed - this is NOT a successful refresh, even though
-            # refresh_all_towns() itself didn't raise. Record it honestly.
-            _last_weather_error = (
-                f"all {failed} tehsils failed to fetch (offline, or "
-                f"Open-Meteo unreachable)"
-            )
+            # refresh_all_towns() itself didn't raise. Record the REAL reason
+            # (e.g. a 429 rate limit) rather than guessing "offline" - a wrong
+            # guess here is actively misleading when debugging.
+            reason = last_fetch_error or "unknown error"
+            _last_weather_error = f"all {failed} tehsils failed to fetch: {reason}"
             logger.warning("Auto-refresh: weather refresh failed - %s",
                            _last_weather_error)
         else:
             _last_weather_refresh = dt.datetime.now()
             _last_weather_error = (
-                f"{failed} of {ok + failed} tehsils failed" if failed else None
+                f"{failed} of {ok + failed} tehsils failed: {last_fetch_error}"
+                if failed else None
             )
             logger.info("Auto-refresh: weather updated at %s (%d/%d ok)",
                        _last_weather_refresh, ok, ok + failed)
@@ -88,18 +89,17 @@ def _refresh_historical_job() -> None:
     global _last_historical_refresh, _last_historical_error
     try:
         from backend.scripts.refresh_historical import refresh_historical
-        ok, failed = refresh_historical(years=10, start_month=4, end_month=9)
+        ok, failed, last_fetch_error = refresh_historical(years=10, start_month=4, end_month=9)
         if ok == 0:
-            _last_historical_error = (
-                f"all {failed} tehsils failed to fetch (offline, or the "
-                f"archive API is unreachable)"
-            )
+            reason = last_fetch_error or "unknown error"
+            _last_historical_error = f"all {failed} tehsils failed to fetch: {reason}"
             logger.warning("Auto-refresh: historical refresh failed - %s",
                            _last_historical_error)
         else:
             _last_historical_refresh = dt.datetime.now()
             _last_historical_error = (
-                f"{failed} of {ok + failed} tehsils failed" if failed else None
+                f"{failed} of {ok + failed} tehsils failed: {last_fetch_error}"
+                if failed else None
             )
             logger.info("Auto-refresh: historical baselines updated at %s (%d/%d ok)",
                        _last_historical_refresh, ok, ok + failed)
@@ -161,11 +161,18 @@ def start_scheduler() -> BackgroundScheduler | None:
     # rebuild immediately instead of leaving "compared to normal" broken for
     # up to a day. This runs in the background thread; it does not block the
     # API from serving requests in the meantime.
+    #
+    # Staggered by 45s after the weather job's immediate run, rather than
+    # firing at the exact same instant: two concurrent bursts of requests
+    # (5 towns each) hitting Open-Meteo in the same second is an easy way to
+    # trip a transient rate limit, especially from a shared/NAT'd IP on a
+    # hosting platform's free tier. Letting the weather burst finish first
+    # keeps each burst small and separated.
     historical_kwargs = {}
     if _historical_table_empty():
-        historical_kwargs["next_run_time"] = dt.datetime.now()
-        logger.info("Historical baselines table is empty - scheduling an "
-                   "immediate rebuild instead of waiting for the daily cycle.")
+        historical_kwargs["next_run_time"] = dt.datetime.now() + dt.timedelta(seconds=45)
+        logger.info("Historical baselines table is empty - scheduling a "
+                   "rebuild in 45s instead of waiting for the daily cycle.")
 
     sched.add_job(
         _refresh_historical_job, "interval", hours=historical_hours,
