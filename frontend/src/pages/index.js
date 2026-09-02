@@ -5,6 +5,7 @@ import TownPanel from "@/components/TownPanel";
 import AlertsPanel from "@/components/AlertsPanel";
 import PredictiveAlertsPanel from "@/components/PredictiveAlertsPanel";
 import RankingPanel from "@/components/RankingPanel";
+import RefreshButton from "@/components/RefreshButton";
 
 // Leaflet must be loaded client-side only (no SSR).
 const RiskMap = dynamic(() => import("@/components/RiskMap"), { ssr: false });
@@ -31,33 +32,40 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
+  // Reusable: loads all dashboard data. Called on mount, and again after the
+  // "Refresh Temperatures" button successfully fetches live data - in that
+  // second case we skip the full-page spinner (showFullPageLoading=false)
+  // since the button already shows its own loading state and the page
+  // shouldn't blank out under the user while they're looking at it.
+  async function loadDashboardData({ showFullPageLoading } = {}) {
+    if (showFullPageLoading) setLoading(true);
+    try {
+      const [towns, ov, al, rk, pa] = await Promise.all([
+        api.towns(),
+        api.overview(),
+        api.alerts(),
+        api.ranking(),
+        api.predictiveAlerts("critical"),
+      ]);
+      setGeojson(towns);
+      setOverview(ov);
+      setAlerts(al.alerts || []);
+      setRanking(rk.ranking || []);
+      setPredictive(pa.alerts || []);
+      setError(null);
+      // Non-critical fetches that shouldn't block the dashboard
+      api.coolingCentres().then(setCoolingCentres).catch(() => {});
+      api.status().then(setDataStatus).catch(() => {});
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      if (showFullPageLoading) setLoading(false);
+    }
+  }
+
   // Initial load
   useEffect(() => {
-    async function load() {
-      try {
-        const [towns, ov, al, rk, pa] = await Promise.all([
-          api.towns(),
-          api.overview(),
-          api.alerts(),
-          api.ranking(),
-          api.predictiveAlerts("critical"),
-        ]);
-        setGeojson(towns);
-        setOverview(ov);
-        setAlerts(al.alerts || []);
-        setRanking(rk.ranking || []);
-        setPredictive(pa.alerts || []);
-        setError(null);
-        // Non-critical fetches that shouldn't block the dashboard
-        api.coolingCentres().then(setCoolingCentres).catch(() => {});
-        api.status().then(setDataStatus).catch(() => {});
-      } catch (e) {
-        setError(e.message);
-      } finally {
-        setLoading(false);
-      }
-    }
-    load();
+    loadDashboardData({ showFullPageLoading: true });
   }, []);
 
   // Load town detail when selection changes
@@ -84,9 +92,14 @@ export default function Home() {
             </p>
           </div>
         </div>
-        <div className="text-xs text-muted text-right">
-          <div className="tracking-wide">City Intelligence · 2023 Census</div>
-          {dataStatus && <FreshnessBadge status={dataStatus} />}
+        <div className="flex items-start gap-4">
+          <div className="text-xs text-muted text-right">
+            <div className="tracking-wide">City Intelligence · 2023 Census</div>
+            {dataStatus && <FreshnessBadge status={dataStatus} />}
+          </div>
+          <RefreshButton
+            onRefreshed={() => loadDashboardData({ showFullPageLoading: false })}
+          />
         </div>
       </header>
 

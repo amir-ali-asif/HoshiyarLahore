@@ -13,6 +13,14 @@ async function getJSON(path) {
   return res.json();
 }
 
+async function postJSON(path) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "POST" });
+  if (!res.ok) {
+    throw new Error(`API ${path} failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 export const api = {
   towns: () => getJSON("/api/towns"),
   town: (id) => getJSON(`/api/towns/${id}`),
@@ -25,6 +33,10 @@ export const api = {
   overview: () => getJSON("/api/overview"),
   ranking: () => getJSON("/api/ranking"),
   status: () => getJSON("/api/status"),
+  // Manually triggers a live weather fetch on the backend (runs the same
+  // logic as refresh_weather.py). Can take several seconds - it waits for
+  // Open-Meteo to actually respond for all 5 tehsils.
+  refreshWeather: () => postJSON("/api/refresh"),
 };
 
 export { API_BASE };

@@ -29,7 +29,7 @@ import datetime as dt
 import json
 import os
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app.db.database import get_connection
@@ -49,8 +49,14 @@ from backend.app.scheduler import (
     stop_scheduler,
     refresh_status,
     trigger_refresh_now,
-    ensure_fresh_weather,
 )
+# Note: ensure_fresh_weather (request-triggered auto-refresh) is NOT wired in
+# right now - superseded by a manual "Refresh Temperatures" button on the
+# frontend (POST /api/refresh below) for more predictable, judge-demo-friendly
+# control. The mechanism is still fully implemented and tested in
+# scheduler.py, ready to re-enable (import it and add
+# `Depends(ensure_fresh_weather)` back to the read endpoints) once the
+# backend runs on a paid, always-on tier where its tradeoffs make more sense.
 
 app = FastAPI(
     title="HoshiyarLahore API",
@@ -165,7 +171,7 @@ def root():
 
 
 @app.get("/api/towns")
-def list_towns(_fresh: None = Depends(ensure_fresh_weather)):
+def list_towns():
     """All towns with current heat risk and geometry (for the map)."""
     conn = get_connection()
     try:
@@ -185,7 +191,7 @@ def list_towns(_fresh: None = Depends(ensure_fresh_weather)):
 
 
 @app.get("/api/towns/{town_id}")
-def town_detail(town_id: str, _fresh: None = Depends(ensure_fresh_weather)):
+def town_detail(town_id: str):
     """Full detail for a single town."""
     conn = get_connection()
     try:
@@ -205,7 +211,7 @@ def town_detail(town_id: str, _fresh: None = Depends(ensure_fresh_weather)):
 
 
 @app.get("/api/towns/{town_id}/forecast")
-def town_forecast(town_id: str, hours: int = 72, _fresh: None = Depends(ensure_fresh_weather)):
+def town_forecast(town_id: str, hours: int = 72):
     """
     (Day 3) 72-hour hourly heat-risk forecast for a tehsil, plus a per-day peak
     summary. Each hour carries its own risk score and band so the frontend can
@@ -239,7 +245,7 @@ def town_forecast(town_id: str, hours: int = 72, _fresh: None = Depends(ensure_f
 
 
 @app.get("/api/towns/{town_id}/sitrep")
-def town_sitrep(town_id: str, _fresh: None = Depends(ensure_fresh_weather)):
+def town_sitrep(town_id: str):
     """
     Operational situation report for a tehsil - a copy-paste-ready brief for
     health officials (WhatsApp/SMS/email), assembled from current risk, forecast
@@ -256,7 +262,7 @@ def town_sitrep(town_id: str, _fresh: None = Depends(ensure_fresh_weather)):
 
 
 @app.get("/api/predictive-alerts")
-def predictive_alerts_endpoint(threshold: str = "high", _fresh: None = Depends(ensure_fresh_weather)):
+def predictive_alerts_endpoint(threshold: str = "high"):
     """
     (Day 3) Lead-time warnings: for each tehsil, the first forecast hour it is
     expected to cross into a dangerous band, e.g. "Lahore City expected to reach
@@ -276,7 +282,7 @@ def predictive_alerts_endpoint(threshold: str = "high", _fresh: None = Depends(e
 
 
 @app.get("/api/alerts")
-def alerts(_fresh: None = Depends(ensure_fresh_weather)):
+def alerts():
     """
     Active alerts derived from current risk scores.
     Alert levels (Day 1 rules):
@@ -319,7 +325,7 @@ def alerts(_fresh: None = Depends(ensure_fresh_weather)):
 
 
 @app.get("/api/ranking")
-def ranking(_fresh: None = Depends(ensure_fresh_weather)):
+def ranking():
     """
     (Day 2) Prioritised town action list for health authorities: every town
     scored and ordered highest-risk first, so officials know where to deploy
@@ -407,7 +413,7 @@ def force_refresh():
 
 
 @app.get("/api/overview")
-def overview(_fresh: None = Depends(ensure_fresh_weather)):
+def overview():
     """Lahore-wide summary for the dashboard header."""
     conn = get_connection()
     try:
