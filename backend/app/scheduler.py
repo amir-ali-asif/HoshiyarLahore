@@ -43,6 +43,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import threading
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -83,6 +84,108 @@ def _refresh_weather_job() -> None:
     except Exception as exc:  # noqa: BLE001 - never let the scheduler die
         _last_weather_error = str(exc)
         logger.warning("Auto-refresh: weather refresh failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Request-triggered "refresh if stale" - see ensure_fresh_weather() below.
+# ---------------------------------------------------------------------------
+
+_refresh_lock = threading.Lock()
+STALE_THRESHOLD_MINUTES = int(os.environ.get("HOSHIYAR_STALE_THRESHOLD_MINUTES", "10"))
+
+
+def _weather_age_minutes() -> float | None:
+    """Age of the current weather data in minutes, or None if there's none yet."""
+    try:
+        from backend.app.db.database import get_connection
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT fetched_at FROM weather_current ORDER BY fetched_at DESC LIMIT 1"
+            ).fetchone()
+            if row is None or not row["fetched_at"]:
+                return None
+            fetched = dt.datetime.fromisoformat(row["fetched_at"])
+            return (dt.datetime.now() - fetched).total_seconds() / 60.0
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_weather_stale() -> bool:
+    age = _weather_age_minutes()
+    return age is None or age > STALE_THRESHOLD_MINUTES
+
+
+def ensure_fresh_weather() -> None:
+    """
+    FastAPI dependency: if the current weather is older than
+    HOSHIYAR_STALE_THRESHOLD_MINUTES (default 10), triggers a SYNCHRONOUS
+    refresh before the request proceeds - so a visitor arriving after a
+    period of inactivity (e.g. a judge opening the site after it's been idle,
+    or waking a sleeping free-tier backend) sees genuinely current data
+    rather than stale cached numbers, without you having to run anything by
+    hand or wait for the next hourly cycle.
+
+    WHY THIS IS SAFE (and doesn't repeat the earlier 429 rate-limit issue):
+    -------------------------------------------------------------------------
+    The frontend fires several API calls in parallel on every page load
+    (towns, overview, alerts, ranking, predictive-alerts). Without locking,
+    each of those concurrent requests would independently decide "data is
+    stale" and each try to refresh - multiplying request volume to
+    Open-Meteo exactly like the burst that caused the original 429 problem.
+
+    A single process-wide lock fixes this: the FIRST request to notice stale
+    data acquires the lock and performs the real refresh; every other
+    concurrent request either finds data already fresh (if it arrives after
+    the refresh completes) or waits briefly for the in-progress refresh
+    rather than starting a duplicate one. If a refresh is already underway
+    and taking unusually long, later requests give up waiting after a bounded
+    timeout and simply proceed with whatever is currently in the database,
+    rather than making the visitor's page hang indefinitely.
+
+    WHY 10 MINUTES BY DEFAULT
+    --------------------------
+    Render's free tier sleeps after 15 minutes idle, so if the backend was
+    asleep, by definition more than 15 minutes have passed since the last
+    request - a 10-minute threshold guarantees that wake-up visit always
+    triggers a genuine refresh. During active use, most page loads/reloads
+    within a 10-minute window are instant (no refetch), so this does not
+    turn every click into a live API call.
+
+    THE TRADEOFF, STATED HONESTLY
+    -------------------------------
+    The one visitor whose request actually triggers the refresh will see a
+    slightly slower page load (typically a few seconds; longer if Open-Meteo
+    is transiently rate-limited and the retry/backoff logic kicks in) while
+    the fetch completes, since this blocks that request. Every other request
+    - including reloads by the same visitor - is effectively instant. This is
+    a deliberate tradeoff in favour of demo-visible freshness; if page-load
+    latency ever matters more than that, lower STALE_THRESHOLD_MINUTES's
+    importance by raising the threshold, or ask for the fully non-blocking
+    ("serve now, refresh in the background") variant instead.
+    """
+    if not _is_weather_stale():
+        return  # fast path: a single indexed DB read, no lock needed
+
+    acquired = _refresh_lock.acquire(timeout=25)
+    if not acquired:
+        logger.warning("ensure_fresh_weather: timed out waiting for an "
+                       "in-progress refresh; serving current data.")
+        return
+    try:
+        if not _is_weather_stale():
+            # Someone else refreshed while we were waiting for the lock.
+            return
+        logger.info(
+            "ensure_fresh_weather: weather data is stale (>%sm old) - "
+            "refreshing now, triggered by an incoming request.",
+            STALE_THRESHOLD_MINUTES,
+        )
+        _refresh_weather_job()
+    finally:
+        _refresh_lock.release()
 
 
 def _refresh_historical_job() -> None:
@@ -213,6 +316,7 @@ def refresh_status() -> dict:
         "auto_refresh_enabled": os.environ.get("HOSHIYAR_AUTO_REFRESH", "1") != "0",
         "refresh_interval_minutes": int(os.environ.get("HOSHIYAR_REFRESH_MINUTES", "60")),
         "historical_interval_hours": int(os.environ.get("HOSHIYAR_HISTORICAL_HOURS", "24")),
+        "request_triggered_refresh_threshold_minutes": STALE_THRESHOLD_MINUTES,
         "weather_last_refreshed": (
             _last_weather_refresh.isoformat() if _last_weather_refresh else None
         ),
