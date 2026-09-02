@@ -152,6 +152,100 @@ def test_concurrent_requests_trigger_only_one_refresh():
     )
 
 
+def _reset_cooldown():
+    """Tests share module-level cooldown state; reset it before/after each
+    cooldown test so they don't interfere with each other or with the tests
+    above this point in the file."""
+    sched._weather_cooldown_until = None
+
+
+def test_failed_refresh_sets_cooldown():
+    """After a total (all-tehsil) 429 failure, a cooldown should activate so
+    subsequent requests don't immediately retry against a still-blocked
+    endpoint."""
+    _reset_cooldown()
+    with patch(
+        "backend.scripts.refresh_weather.refresh_all_towns",
+        return_value=(0, 5, "429 Client Error: Too Many Requests"),
+    ):
+        sched._refresh_weather_job()
+    try:
+        assert sched._in_failure_cooldown() is True
+        assert sched._weather_cooldown_until is not None
+    finally:
+        _reset_cooldown()
+
+
+def test_non_429_failure_does_not_set_cooldown():
+    """A different kind of failure (e.g. a plain timeout, no '429' in the
+    message) should NOT trigger the cooldown - it's specifically meant for
+    the sustained-rate-limit case, not every possible failure reason."""
+    _reset_cooldown()
+    with patch(
+        "backend.scripts.refresh_weather.refresh_all_towns",
+        return_value=(0, 5, "Connection timed out"),
+    ):
+        sched._refresh_weather_job()
+    try:
+        assert sched._in_failure_cooldown() is False
+    finally:
+        _reset_cooldown()
+
+
+def test_ensure_fresh_weather_skips_refresh_during_cooldown():
+    """The core fix: once a cooldown is active, ensure_fresh_weather() must
+    NOT attempt another refresh, even though data is stale - it should serve
+    current data immediately instead of retrying against a known-blocked
+    endpoint."""
+    _reset_cooldown()
+    db_path = _temp_db_with_weather(age_minutes=sched.STALE_THRESHOLD_MINUTES + 5)
+    sched._weather_cooldown_until = dt.datetime.now() + dt.timedelta(minutes=5)
+    try:
+        with _patched_connection(db_path), \
+             patch.object(sched, "_refresh_weather_job") as mock_job:
+            sched.ensure_fresh_weather()
+            assert not mock_job.called, (
+                "should not attempt a refresh while a failure cooldown is active"
+            )
+    finally:
+        os.remove(db_path)
+        _reset_cooldown()
+
+
+def test_ensure_fresh_weather_resumes_after_cooldown_expires():
+    """Once the cooldown window has passed, the very next stale-triggering
+    request should try again for real - the app must not stay in a
+    permanently degraded state after one bad rate-limit window."""
+    _reset_cooldown()
+    db_path = _temp_db_with_weather(age_minutes=sched.STALE_THRESHOLD_MINUTES + 5)
+    sched._weather_cooldown_until = dt.datetime.now() - dt.timedelta(seconds=1)  # just expired
+    try:
+        with _patched_connection(db_path), \
+             patch.object(sched, "_refresh_weather_job") as mock_job:
+            sched.ensure_fresh_weather()
+            assert mock_job.called, (
+                "should attempt a fresh refresh once the cooldown has expired"
+            )
+    finally:
+        os.remove(db_path)
+        _reset_cooldown()
+
+
+def test_successful_refresh_clears_an_active_cooldown():
+    _reset_cooldown()
+    sched._weather_cooldown_until = dt.datetime.now() + dt.timedelta(minutes=5)
+    try:
+        with patch(
+            "backend.scripts.refresh_weather.refresh_all_towns",
+            return_value=(5, 0, None),
+        ):
+            sched._refresh_weather_job()
+        assert sched._weather_cooldown_until is None
+        assert sched._in_failure_cooldown() is False
+    finally:
+        _reset_cooldown()
+
+
 def _run_all():
     fns = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     passed = 0

@@ -60,7 +60,7 @@ _scheduler: BackgroundScheduler | None = None
 
 
 def _refresh_weather_job() -> None:
-    global _last_weather_refresh, _last_weather_error
+    global _last_weather_refresh, _last_weather_error, _weather_cooldown_until
     try:
         from backend.scripts.refresh_weather import refresh_all_towns
         ok, failed, last_fetch_error = refresh_all_towns()
@@ -73,12 +73,30 @@ def _refresh_weather_job() -> None:
             _last_weather_error = f"all {failed} tehsils failed to fetch: {reason}"
             logger.warning("Auto-refresh: weather refresh failed - %s",
                            _last_weather_error)
+            # A persistent 429 (e.g. Open-Meteo rate-limiting a shared/NAT'd
+            # host IP - common on free hosting tiers) will not clear up in the
+            # handful of seconds our per-request retries wait. Without a
+            # cooldown, every subsequent visitor's request would immediately
+            # retrigger another full multi-town retry cycle against an
+            # endpoint that's still blocked - slow for that visitor and
+            # needlessly hammers Open-Meteo harder. Back off for a while
+            # instead, and just serve current data until the cooldown expires.
+            if "429" in reason:
+                _weather_cooldown_until = dt.datetime.now() + dt.timedelta(
+                    minutes=WEATHER_FAILURE_COOLDOWN_MINUTES
+                )
+                logger.warning(
+                    "Auto-refresh: backing off further attempts until %s "
+                    "(%d minute cooldown after a 429).",
+                    _weather_cooldown_until, WEATHER_FAILURE_COOLDOWN_MINUTES,
+                )
         else:
             _last_weather_refresh = dt.datetime.now()
             _last_weather_error = (
                 f"{failed} of {ok + failed} tehsils failed: {last_fetch_error}"
                 if failed else None
             )
+            _weather_cooldown_until = None  # a real success clears any cooldown
             logger.info("Auto-refresh: weather updated at %s (%d/%d ok)",
                        _last_weather_refresh, ok, ok + failed)
     except Exception as exc:  # noqa: BLE001 - never let the scheduler die
@@ -92,6 +110,12 @@ def _refresh_weather_job() -> None:
 
 _refresh_lock = threading.Lock()
 STALE_THRESHOLD_MINUTES = int(os.environ.get("HOSHIYAR_STALE_THRESHOLD_MINUTES", "10"))
+
+# Cooldown after a total (all-tehsil) 429 failure - see _refresh_weather_job().
+WEATHER_FAILURE_COOLDOWN_MINUTES = int(
+    os.environ.get("HOSHIYAR_FAILURE_COOLDOWN_MINUTES", "5")
+)
+_weather_cooldown_until: dt.datetime | None = None
 
 
 def _weather_age_minutes() -> float | None:
@@ -116,6 +140,10 @@ def _weather_age_minutes() -> float | None:
 def _is_weather_stale() -> bool:
     age = _weather_age_minutes()
     return age is None or age > STALE_THRESHOLD_MINUTES
+
+
+def _in_failure_cooldown() -> bool:
+    return _weather_cooldown_until is not None and dt.datetime.now() < _weather_cooldown_until
 
 
 def ensure_fresh_weather() -> None:
@@ -145,6 +173,23 @@ def ensure_fresh_weather() -> None:
     timeout and simply proceed with whatever is currently in the database,
     rather than making the visitor's page hang indefinitely.
 
+    WHY THERE'S ALSO A FAILURE COOLDOWN
+    -------------------------------------
+    A 429 from Open-Meteo can be a brief burst-related hiccup (recovers in
+    seconds - our per-request retry/backoff handles that fine) OR a longer,
+    IP-level rate limit (e.g. Open-Meteo's free tier is limited per IP, and
+    a shared/NAT'd IP on a hosting platform's free tier can already be
+    exhausted by OTHER tenants' unrelated traffic - not fixable by this app
+    being more conservative on its own). Without a cooldown, EVERY visitor's
+    request during a longer block would independently retrigger a full
+    multi-town retry cycle against an endpoint that's still rate-limited -
+    slow for that visitor (multiple seconds of retries, doomed to fail) and
+    it hammers Open-Meteo harder rather than giving the block a chance to
+    clear. After a total (all-tehsil) 429 failure, further attempts back off
+    for HOSHIYAR_FAILURE_COOLDOWN_MINUTES (default 5) - visitors during that
+    window get an instant response with whatever data is currently cached,
+    and the very next attempt after the cooldown expires tries again for real.
+
     WHY 10 MINUTES BY DEFAULT
     --------------------------
     Render's free tier sleeps after 15 minutes idle, so if the backend was
@@ -169,6 +214,13 @@ def ensure_fresh_weather() -> None:
     if not _is_weather_stale():
         return  # fast path: a single indexed DB read, no lock needed
 
+    if _in_failure_cooldown():
+        # We already know (from a very recent attempt) that Open-Meteo is
+        # rate-limiting us. Don't retry on every request during the cooldown -
+        # just serve current data instantly instead of making this visitor
+        # wait through a retry cycle that's very likely to fail again.
+        return
+
     acquired = _refresh_lock.acquire(timeout=25)
     if not acquired:
         logger.warning("ensure_fresh_weather: timed out waiting for an "
@@ -177,6 +229,10 @@ def ensure_fresh_weather() -> None:
     try:
         if not _is_weather_stale():
             # Someone else refreshed while we were waiting for the lock.
+            return
+        if _in_failure_cooldown():
+            # Someone else's attempt (while we waited for the lock) just
+            # failed with a 429 and started a fresh cooldown - don't pile on.
             return
         logger.info(
             "ensure_fresh_weather: weather data is stale (>%sm old) - "
@@ -317,6 +373,10 @@ def refresh_status() -> dict:
         "refresh_interval_minutes": int(os.environ.get("HOSHIYAR_REFRESH_MINUTES", "60")),
         "historical_interval_hours": int(os.environ.get("HOSHIYAR_HISTORICAL_HOURS", "24")),
         "request_triggered_refresh_threshold_minutes": STALE_THRESHOLD_MINUTES,
+        "weather_failure_cooldown_active": _in_failure_cooldown(),
+        "weather_failure_cooldown_until": (
+            _weather_cooldown_until.isoformat() if _weather_cooldown_until else None
+        ),
         "weather_last_refreshed": (
             _last_weather_refresh.isoformat() if _last_weather_refresh else None
         ),

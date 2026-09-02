@@ -40,7 +40,7 @@ TIMEZONE = "Asia/Karachi"
 REQUEST_TIMEOUT = 30
 
 
-def _get_with_retry(url: str, params: dict, max_retries: int = 3):
+def _get_with_retry(url: str, params: dict, max_retries: int = 1):
     """
     GET with retry-and-backoff specifically for HTTP 429 (Too Many Requests).
 
@@ -48,9 +48,17 @@ def _get_with_retry(url: str, params: dict, max_retries: int = 3):
     https://open-meteo.com/en/terms) but a burst of near-simultaneous requests
     (e.g. several towns fetched back-to-back at app startup), especially from
     a shared/NAT'd IP on a hosting platform's free tier, can still trip a
-    transient 429. Rather than immediately giving up on that town, wait and
-    retry a few times first - this is standard, expected behaviour for any
-    rate-limited API and resolves the large majority of these hiccups.
+    transient 429. One retry catches that kind of brief hiccup.
+
+    max_retries is deliberately small (1, not 3+): observed in production
+    that a SUSTAINED 429 (a longer, IP-level rate limit - e.g. a shared
+    Render free-tier IP already exhausted by other tenants' unrelated
+    traffic, not something this app's own request pattern can fix) does NOT
+    clear up within a short retry window, so spending longer just delays the
+    response without improving the odds. The failure-cooldown mechanism in
+    scheduler.py (WEATHER_FAILURE_COOLDOWN_MINUTES) is what actually handles
+    that longer case - by backing off entirely for several minutes after a
+    total failure, rather than every visitor's request retrying in vain.
     """
     delay = 2.0
     last_exc: Exception | None = None
